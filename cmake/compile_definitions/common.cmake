@@ -139,7 +139,7 @@ list(APPEND SUNSHINE_DEFINITIONS SUNSHINE_PUBLISHER_ISSUE_URL="${SUNSHINE_PUBLIS
 set(PYROWAVE_ROOT "" CACHE PATH "pyrowave install prefix")
 if(PYROWAVE_ROOT)
     find_library(PYROWAVE_LIBRARY
-            NAMES pyrowave-shared pyrowave-static libpyrowave-shared
+            NAMES pyrowave-shared pyrowave-static libpyrowave-shared pyrowave-c-api-static
             PATHS "${PYROWAVE_ROOT}"
             PATH_SUFFIXES lib lib64)
     find_path(PYROWAVE_INCLUDE_DIR pyrowave/pyrowave.h
@@ -147,6 +147,7 @@ if(PYROWAVE_ROOT)
             PATH_SUFFIXES include)
     if(PYROWAVE_LIBRARY AND PYROWAVE_INCLUDE_DIR)
         message(STATUS "Enabling PyroWave: ${PYROWAVE_LIBRARY}")
+        set(PYROWAVE_ENABLED ON)
         list(APPEND SUNSHINE_DEFINITIONS PYROWAVE_ENABLED=1)
         include_directories(BEFORE SYSTEM "${PYROWAVE_INCLUDE_DIR}")
         list(APPEND SUNSHINE_EXTERNAL_LIBRARIES ${PYROWAVE_LIBRARY})

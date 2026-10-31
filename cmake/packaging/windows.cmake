@@ -4,6 +4,25 @@ install(TARGETS sunshine RUNTIME DESTINATION "." COMPONENT application)
 # Hardening: include zlib1.dll (loaded via LoadLibrary() in openssl's libcrypto.a)
 install(FILES "${ZLIB}" DESTINATION "." COMPONENT application)
 
+# PyroWave: sunshine.exe imports the C API from pyrowave-shared.dll, and that
+# DLL carries its own MinGW C++ runtime, so both have to sit next to the exe.
+# (Vulkan itself is loaded at runtime through volk, i.e. the GPU driver's
+# vulkan-1.dll, so nothing needs to be bundled for it.)
+if(PYROWAVE_ENABLED)
+    get_filename_component(MINGW_RUNTIME_BIN "${CMAKE_CXX_COMPILER}" DIRECTORY)
+    foreach(PYROWAVE_RUNTIME_DLL
+            "${PYROWAVE_ROOT}/bin/pyrowave-shared.dll"
+            "${MINGW_RUNTIME_BIN}/libstdc++-6.dll"
+            "${MINGW_RUNTIME_BIN}/libgcc_s_seh-1.dll"
+            "${MINGW_RUNTIME_BIN}/libwinpthread-1.dll")
+        if(EXISTS "${PYROWAVE_RUNTIME_DLL}")
+            install(FILES "${PYROWAVE_RUNTIME_DLL}" DESTINATION "." COMPONENT application)
+        else()
+            message(WARNING "PyroWave runtime file not found, package may not start: ${PYROWAVE_RUNTIME_DLL}")
+        endif()
+    endforeach()
+endif()
+
 # ViGEmBus installer
 set(VIGEMBUS_INSTALLER "${CMAKE_BINARY_DIR}/vigembus_installer.exe")
 file(DOWNLOAD

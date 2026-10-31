@@ -70,6 +70,7 @@ jobs:
             mingw-w64-ucrt-x86_64-opus
             mingw-w64-ucrt-x86_64-nlohmann_json
             mingw-w64-ucrt-x86_64-boost
+            mingw-w64-ucrt-x86_64-vulkan-headers
 
       - name: Build and install libpyrowave
         run: |
