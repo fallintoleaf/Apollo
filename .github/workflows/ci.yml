@@ -52,6 +52,9 @@ jobs:
           msystem: UCRT64
           update: false
           release: true
+          # "minimal" (the default) drops the Windows PATH, which hides the
+          # Node.js installed by setup-node, so cmake cannot find npm.
+          path-type: inherit
           install: >-
             git
             mingw-w64-ucrt-x86_64-cmake
@@ -86,13 +89,21 @@ jobs:
       - name: Configure Apollo
         run: |
           set -euxo pipefail
+          # Locate the Node.js installed by setup-node and make it visible to
+          # both the shell and cmake's find_program(NPM). Passing -DNPM pins the
+          # exact npm.cmd, so the web-ui target works in the build step too.
+          NODE_DIR="$(ls -d "$(cygpath -u "${RUNNER_TOOL_CACHE}")"/node/*/x64 | tail -1)"
+          export PATH="${NODE_DIR}:${PATH}"
+          npm --version
           cmake -B build -G Ninja -S . \
             -DCMAKE_BUILD_TYPE=Release \
-            -DPYROWAVE_ROOT="${GITHUB_WORKSPACE}/pyrowave-install"
+            -DPYROWAVE_ROOT="${GITHUB_WORKSPACE}/pyrowave-install" \
+            -DNPM="$(cygpath -w "${NODE_DIR}/npm.cmd")"
 
       - name: Build Apollo
         run: |
           set -euxo pipefail
+          export PATH="$(ls -d "$(cygpath -u "${RUNNER_TOOL_CACHE}")"/node/*/x64 | tail -1):${PATH}"
           cmake --build build
 
       - name: Package Apollo (portable ZIP)
