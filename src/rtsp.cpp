@@ -12,7 +12,10 @@ extern "C" {
 // standard includes
 #include <array>
 #include <cctype>
+#include <charconv>
 #include <format>
+#include <limits>
+#include <optional>
 #include <set>
 #include <unordered_map>
 #include <utility>
@@ -27,6 +30,7 @@ extern "C" {
 #include "input.h"
 #include "logging.h"
 #include "network.h"
+#include "pyrowave/pyrowave_server.h"
 #include "rtsp.h"
 #include "stream.h"
 #include "sync.h"
@@ -823,6 +827,18 @@ namespace rtsp_stream {
       ss << "a=rtpmap:98 AV1/90000"sv << std::endl;
     }
 
+    // Advertise PyroWave through the versioned x-ss-pyrowave contract.
+    // Clients that don't support the extension ignore these attributes and
+    // negotiate a legacy format below. Do not put the out-of-range numeric
+    // format ID into the legacy bitStreamFormat attribute.
+    if (pyrowave::is_compiled() && pyrowave::is_server_runtime_available()) {
+      ss << "a=x-ss-pyrowave.protocolVersion:" << LI_PYROWAVE_PROTOCOL_VERSION << std::endl;
+      ss << "a=x-ss-pyrowave.bitstreamVersion:" << LI_PYROWAVE_BITSTREAM_VERSION << std::endl;
+      ss << "a=x-ss-pyrowave.payloadVersion:" << LI_PYROWAVE_PAYLOAD_VERSION << std::endl;
+      ss << "a=x-ss-pyrowave.capabilityFlags:" << pyrowave::SERVER_CAPABILITY_FLAGS << std::endl;
+      ss << "a=x-ss-pyrowave.maxPacketSize:" << LI_PYROWAVE_MAX_PACKET_SIZE << std::endl;
+    }
+
     if (!session.surround_params.empty()) {
       // If we have our own surround parameters, advertise them twice first
       ss << "a=fmtp:97 surround-params="sv << session.surround_params << std::endl;
@@ -1023,6 +1039,91 @@ namespace rtsp_stream {
       config.monitor.chromaSamplingType = util::from_view(args.at("x-ss-video[0].chromaSamplingType"sv));
       config.monitor.enableIntraRefresh = util::from_view(args.at("x-ss-video[0].intraRefresh"sv));
 
+      // PyroWave: the client signals the experimental format through
+      // bitStreamFormat = 0x00010000. Map it to the internal video format
+      // value and validate the versioned client capability contract.
+      const auto requested_video_format = config.monitor.videoFormat;
+      if (pyrowave::is_experimental_video_format((std::uint32_t) requested_video_format)) {
+        // Color contract: SDR BT.709 or static HDR10/HLG BT.2020, 4:2:0 only,
+        // with a valid YUV range encoded in encoderCscMode.
+        const auto is_sdr = config.monitor.dynamicRange == 0;
+        const auto is_hdr10 = config.monitor.dynamicRange == 1;
+        const auto is_hlg = config.monitor.dynamicRange == 2;
+        const auto pyro_colorspace = config.monitor.encoderCscMode >> 1;
+        const auto is_bt709 = pyro_colorspace == 1;
+        const auto is_bt2020 = pyro_colorspace == 2;
+        const auto is_full_or_limited = pyro_colorspace == 1 || pyro_colorspace == 2;
+        if ((!is_sdr && !is_hdr10 && !is_hlg) || config.monitor.chromaSamplingType != 0 ||
+            (is_sdr && !is_bt709) || ((is_hdr10 || is_hlg) && !is_bt2020) || !is_full_or_limited) {
+          BOOST_LOG(warning) << "Rejecting PyroWave video format: SDR BT.709 or HDR10/HLG BT.2020 4:2:0 with a valid color range is required";
+          respond(sock, session, &option, 415, "UNSUPPORTED MEDIA TYPE", req->sequenceNumber, {});
+          return;
+        }
+
+        if (!pyrowave::is_compiled() || !pyrowave::is_server_runtime_available()) {
+          BOOST_LOG(warning) << "Rejecting PyroWave video format: not available in this build";
+          respond(sock, session, &option, 415, "UNSUPPORTED MEDIA TYPE", req->sequenceNumber, {});
+          return;
+        }
+
+        const auto parse_pyrowave_u32 = [&args](std::string_view key) -> std::optional<std::uint32_t> {
+          auto entry = args.find(key);
+          if (entry == args.end() || entry->second.empty()) {
+            return std::nullopt;
+          }
+          std::uint32_t value = 0;
+          const auto begin = entry->second.data();
+          const auto end = begin + entry->second.size();
+          const auto parsed = std::from_chars(begin, end, value);
+          if (parsed.ec != std::errc {} || parsed.ptr != end) {
+            return std::nullopt;
+          }
+          return value;
+        };
+
+        const auto protocol_version = parse_pyrowave_u32("x-ml-pyrowave.protocolVersion"sv);
+        const auto bitstream_version = parse_pyrowave_u32("x-ml-pyrowave.bitstreamVersion"sv);
+        const auto payload_version = parse_pyrowave_u32("x-ml-pyrowave.payloadVersion"sv);
+        const auto capability_flags = parse_pyrowave_u32("x-ml-pyrowave.capabilityFlags"sv);
+        const auto max_packet_size = parse_pyrowave_u32("x-ml-pyrowave.maxPacketSize"sv);
+
+        const auto full_range = (config.monitor.encoderCscMode & 0x1) != 0;
+        const auto negotiated = [&]() -> std::optional<std::uint32_t> {
+          if (!protocol_version || !bitstream_version || !payload_version ||
+              !capability_flags || !max_packet_size ||
+              *protocol_version > std::numeric_limits<std::uint16_t>::max() ||
+              *bitstream_version > std::numeric_limits<std::uint16_t>::max() ||
+              *payload_version > std::numeric_limits<std::uint16_t>::max()) {
+            return std::nullopt;
+          }
+          auto result = pyrowave::negotiate_client_caps(
+            (std::uint16_t) *protocol_version, (std::uint16_t) *bitstream_version,
+            (std::uint16_t) *payload_version, *capability_flags, *max_packet_size,
+            config.monitor.dynamicRange, full_range);
+          if (!result.ok) {
+            return std::nullopt;
+          }
+          return result.negotiated_max_packet_size;
+        }();
+        if (!negotiated) {
+          BOOST_LOG(warning) << "Rejecting PyroWave video format: client capability contract is incompatible";
+          respond(sock, session, &option, 415, "UNSUPPORTED MEDIA TYPE", req->sequenceNumber, {});
+          return;
+        }
+
+        const auto clamped_packet_size = pyrowave::limit_rtp_packet_size(config.packetsize, *negotiated);
+        if (clamped_packet_size == 0) {
+          BOOST_LOG(warning) << "Rejecting PyroWave video format: negotiated packet size is too small";
+          respond(sock, session, &option, 415, "UNSUPPORTED MEDIA TYPE", req->sequenceNumber, {});
+          return;
+        }
+        config.packetsize = clamped_packet_size;
+
+        BOOST_LOG(info) << "Client requested PyroWave";
+        config.monitor.videoFormat = pyrowave::INTERNAL_VIDEO_FORMAT;
+      }
+      config.monitor.packetSize = config.packetsize;
+
       if (config::video.limit_framerate) {
         config.monitor.encodingFramerate = session.fps;
       } else {
@@ -1113,23 +1214,30 @@ namespace rtsp_stream {
     if (configuredBitrateKbps) {
       BOOST_LOG(debug) << "Client configured bitrate is "sv << configuredBitrateKbps << " Kbps"sv;
 
-      // If the FEC percentage isn't too high, adjust the configured bitrate to ensure video
-      // traffic doesn't exceed the user's selected bitrate when the FEC shards are included.
-      if (config::stream.fec_percentage <= 80) {
-        configuredBitrateKbps /= 100.f / (100 - config::stream.fec_percentage);
+      if (config.monitor.videoFormat == pyrowave::INTERNAL_VIDEO_FORMAT) {
+        // PyroWave's per-frame cap is the quality control and it carries its
+        // own block-aware parity. Keep the slider value as the encoder budget.
+        BOOST_LOG(info) << "PyroWave bitrate from client: "sv << configuredBitrateKbps << " kbps"sv;
+        config.monitor.bitrate = (int) configuredBitrateKbps;
+      } else {
+        // If the FEC percentage isn't too high, adjust the configured bitrate to ensure video
+        // traffic doesn't exceed the user's selected bitrate when the FEC shards are included.
+        if (config::stream.fec_percentage <= 80) {
+          configuredBitrateKbps /= 100.f / (100 - config::stream.fec_percentage);
+        }
+
+        // Adjust the bitrate to account for audio traffic bandwidth usage (capped at 20% reduction).
+        // The bitrate per channel is 256 Kbps for high quality mode and 96 Kbps for normal quality.
+        auto audioBitrateAdjustment = (config.audio.flags[audio::config_t::HIGH_QUALITY] ? 256 : 96) * config.audio.channels;
+        configuredBitrateKbps -= std::min((std::int64_t) audioBitrateAdjustment, configuredBitrateKbps / 5);
+
+        // Reduce it by another 500Kbps to account for A/V packet overhead and control data
+        // traffic (capped at 10% reduction).
+        configuredBitrateKbps -= std::min((std::int64_t) 500, configuredBitrateKbps / 10);
+
+        BOOST_LOG(debug) << "Final adjusted video encoding bitrate is "sv << configuredBitrateKbps << " Kbps"sv;
+        config.monitor.bitrate = configuredBitrateKbps;
       }
-
-      // Adjust the bitrate to account for audio traffic bandwidth usage (capped at 20% reduction).
-      // The bitrate per channel is 256 Kbps for high quality mode and 96 Kbps for normal quality.
-      auto audioBitrateAdjustment = (config.audio.flags[audio::config_t::HIGH_QUALITY] ? 256 : 96) * config.audio.channels;
-      configuredBitrateKbps -= std::min((std::int64_t) audioBitrateAdjustment, configuredBitrateKbps / 5);
-
-      // Reduce it by another 500Kbps to account for A/V packet overhead and control data
-      // traffic (capped at 10% reduction).
-      configuredBitrateKbps -= std::min((std::int64_t) 500, configuredBitrateKbps / 10);
-
-      BOOST_LOG(debug) << "Final adjusted video encoding bitrate is "sv << configuredBitrateKbps << " Kbps"sv;
-      config.monitor.bitrate = configuredBitrateKbps;
     }
 
     if (config.monitor.videoFormat == 1 && video::active_hevc_mode == 1) {

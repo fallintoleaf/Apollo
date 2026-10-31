@@ -1375,14 +1375,18 @@ namespace stream {
         }
       }
 
+      const bool is_pyrowave = session->config.monitor.videoFormat == 3;
+
       video_short_frame_header_t frame_header = {};
       frame_header.headerType = 0x01;  // Short header type
       frame_header.frameType = packet->is_idr()                     ? 2 :
                                packet->after_ref_frame_invalidation ? 5 :
                                                                       1;
-      frame_header.lastPayloadLen = (payload.size() + sizeof(frame_header)) % (session->config.packetsize - sizeof(NV_VIDEO_PACKET));
-      if (frame_header.lastPayloadLen == 0) {
-        frame_header.lastPayloadLen = session->config.packetsize - sizeof(NV_VIDEO_PACKET);
+      if (!is_pyrowave) {
+        frame_header.lastPayloadLen = (payload.size() + sizeof(frame_header)) % (session->config.packetsize - sizeof(NV_VIDEO_PACKET));
+        if (frame_header.lastPayloadLen == 0) {
+          frame_header.lastPayloadLen = session->config.packetsize - sizeof(NV_VIDEO_PACKET);
+        }
       }
 
       if (packet->frame_timestamp) {
@@ -1399,11 +1403,34 @@ namespace stream {
       }
 
       auto fecPercentage = config::stream.fec_percentage;
+      if (is_pyrowave) {
+        // PyroWave carries its own block-aware XOR parity inside the PYRF
+        // envelope; legacy RTP FEC must stay disabled for this format.
+        fecPercentage = 0;
+      }
 
       // Insert space for packet headers
       auto blocksize = session->config.packetsize + MAX_RTP_HEADER_SIZE;
       auto payload_blocksize = blocksize - sizeof(video_packet_raw_t);
-      auto payload_new = concat_and_insert(sizeof(video_packet_raw_t), payload_blocksize, std::string_view {(char *) &frame_header, sizeof(frame_header)}, payload);
+      std::vector<uint8_t> payload_new;
+      if (is_pyrowave) {
+        // PyroWave packets already carry their own framing and must stay
+        // aligned to the outer RTP payload boundary; the legacy short frame
+        // header would shift the first inner block by eight bytes. The client
+        // obtains frame boundaries from PYRF instead, but the outer
+        // video_packet_raw_t headers are still required by RTP transport.
+        auto packet_count = (payload.size() + payload_blocksize - 1) / payload_blocksize;
+        payload_new.resize(packet_count * sizeof(video_packet_raw_t) + payload.size());
+        for (std::size_t index = 0; index < packet_count; ++index) {
+          auto offset = index * payload_blocksize;
+          auto chunk_size = std::min<std::size_t>(payload_blocksize, payload.size() - offset);
+          auto *destination = payload_new.data() + index * (sizeof(video_packet_raw_t) + payload_blocksize);
+          std::memset(destination, 0, sizeof(video_packet_raw_t));
+          std::memcpy(destination + sizeof(video_packet_raw_t), payload.data() + offset, chunk_size);
+        }
+      } else {
+        payload_new = concat_and_insert(sizeof(video_packet_raw_t), payload_blocksize, std::string_view {(char *) &frame_header, sizeof(frame_header)}, payload);
+      }
 
       payload = std::string_view {(char *) payload_new.data(), payload_new.size()};
 

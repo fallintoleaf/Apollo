@@ -114,6 +114,11 @@ set(SUNSHINE_TARGET_FILES
         "${CMAKE_SOURCE_DIR}/src/stat_trackers.cpp"
         "${CMAKE_SOURCE_DIR}/src/rswrapper.h"
         "${CMAKE_SOURCE_DIR}/src/rswrapper.c"
+        "${CMAKE_SOURCE_DIR}/src/pyrowave/PyrowaveProtocol.h"
+        "${CMAKE_SOURCE_DIR}/src/pyrowave/PyrowaveProtocol.c"
+        "${CMAKE_SOURCE_DIR}/src/pyrowave/DynamicHdr.h"
+        "${CMAKE_SOURCE_DIR}/src/pyrowave/pyrowave_server.h"
+        "${CMAKE_SOURCE_DIR}/src/pyrowave/pyrowave_server.cpp"
         ${PLATFORM_TARGET_FILES})
 
 if(NOT SUNSHINE_ASSETS_DIR_DEF)
@@ -127,6 +132,28 @@ list(APPEND SUNSHINE_DEFINITIONS SUNSHINE_TRAY=${SUNSHINE_TRAY})
 list(APPEND SUNSHINE_DEFINITIONS SUNSHINE_PUBLISHER_NAME="${SUNSHINE_PUBLISHER_NAME}")
 list(APPEND SUNSHINE_DEFINITIONS SUNSHINE_PUBLISHER_WEBSITE="${SUNSHINE_PUBLISHER_WEBSITE}")
 list(APPEND SUNSHINE_DEFINITIONS SUNSHINE_PUBLISHER_ISSUE_URL="${SUNSHINE_PUBLISHER_ISSUE_URL}")
+
+# PyroWave support: point PYROWAVE_ROOT at a pyrowave install prefix
+# (containing include/pyrowave/pyrowave.h and the library). When found, the
+# PYROWAVE_ENABLED compile definition is set and the library is linked.
+set(PYROWAVE_ROOT "" CACHE PATH "pyrowave install prefix")
+if(PYROWAVE_ROOT)
+    find_library(PYROWAVE_LIBRARY
+            NAMES pyrowave-shared pyrowave-static libpyrowave-shared
+            PATHS "${PYROWAVE_ROOT}"
+            PATH_SUFFIXES lib lib64)
+    find_path(PYROWAVE_INCLUDE_DIR pyrowave/pyrowave.h
+            PATHS "${PYROWAVE_ROOT}"
+            PATH_SUFFIXES include)
+    if(PYROWAVE_LIBRARY AND PYROWAVE_INCLUDE_DIR)
+        message(STATUS "Enabling PyroWave: ${PYROWAVE_LIBRARY}")
+        list(APPEND SUNSHINE_DEFINITIONS PYROWAVE_ENABLED=1)
+        include_directories(BEFORE SYSTEM "${PYROWAVE_INCLUDE_DIR}")
+        list(APPEND SUNSHINE_EXTERNAL_LIBRARIES ${PYROWAVE_LIBRARY})
+    else()
+        message(WARNING "PYROWAVE_ROOT was set but pyrowave headers/library were not found; building without PyroWave")
+    endif()
+endif()
 
 include_directories(BEFORE "${CMAKE_SOURCE_DIR}")
 

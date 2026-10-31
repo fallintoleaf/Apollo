@@ -28,6 +28,7 @@ extern "C" {
 #include "logging.h"
 #include "nvenc/nvenc_base.h"
 #include "platform/common.h"
+#include "pyrowave/pyrowave_server.h"
 #include "sync.h"
 #include "video.h"
 
@@ -326,7 +327,7 @@ namespace video {
 
     ~avcodec_encode_session_t() {
       // Flush any remaining frames in the encoder
-      if (avcodec_send_frame(avcodec_ctx.get(), nullptr) == 0) {
+      if (avcodec_ctx && avcodec_send_frame(avcodec_ctx.get(), nullptr) == 0) {
         packet_raw_avcodec pkt;
         while (avcodec_receive_packet(avcodec_ctx.get(), pkt.av_packet) == 0);
       }
@@ -379,6 +380,13 @@ namespace video {
 
     avcodec_ctx_t avcodec_ctx;
     std::unique_ptr<platf::avcodec_encode_device_t> device;
+
+    // PyroWave session state. When pyro_encoder is set, encoding is dispatched
+    // to encode_pyrowave() instead of the FFmpeg pipeline.
+    std::unique_ptr<pyrowave::encode_session_t> pyro_session;
+    std::size_t pyro_max_bytes = 0;
+    std::size_t pyro_packet_boundary = 0;  // inner PYRF payload capacity (wire packet - 64)
+    int pyro_framerate = 60;
 
     std::vector<packet_raw_t::replace_t> replacements;
 
@@ -1145,6 +1153,16 @@ namespace video {
     refresh_displays(dev_type, display_names, current_display_index, empty_str);
   }
 
+  // PyroWave encodes from system-memory frames, so capture must use the
+  // system-memory device type regardless of the selected encoder.
+  platf::mem_type_e
+  capture_dev_type_for(const encoder_t &encoder, const config_t &config) {
+    if (config.videoFormat == pyrowave::INTERNAL_VIDEO_FORMAT) {
+      return platf::mem_type_e::system;
+    }
+    return encoder.platform_formats->dev_type;
+  }
+
   void captureThread(
     std::shared_ptr<safe::queue_t<capture_ctx_t>> capture_ctx_queue,
     sync_util::sync_t<std::weak_ptr<platf::display_t>> &display_wp,
@@ -1177,14 +1195,15 @@ namespace video {
     std::vector<std::string> display_names;
     int display_p = -1;
     std::shared_ptr<platf::display_t> disp;
+    auto capture_dev_type = capture_dev_type_for(encoder, capture_ctxs.front().config);
     if (!proc::proc.display_name.empty()) {
-      disp = platf::display(encoder.platform_formats->dev_type, proc::proc.display_name, capture_ctxs.front().config);
+      disp = platf::display(capture_dev_type, proc::proc.display_name, capture_ctxs.front().config);
     }
     if (!disp) {
       // Get all the monitor names now, rather than at boot, to
       // get the most up-to-date list available monitors
-      refresh_displays(encoder.platform_formats->dev_type, display_names, display_p);
-      disp = platf::display(encoder.platform_formats->dev_type, display_names[display_p], capture_ctxs.front().config);
+      refresh_displays(capture_dev_type, display_names, display_p);
+      disp = platf::display(capture_dev_type, display_names[display_p], capture_ctxs.front().config);
       if (disp) {
         proc::proc.display_name = display_names[display_p];
       } else {
@@ -1376,7 +1395,7 @@ namespace video {
               disp.reset();
 
               // Refresh display names since a display removal might have caused the reinitialization
-              refresh_displays(encoder.platform_formats->dev_type, display_names, display_p, proc::proc.display_name);
+              refresh_displays(capture_dev_type, display_names, display_p, proc::proc.display_name);
 
               // Process any pending display switch with the new list of displays
               if (switch_display_event->peek()) {
@@ -1384,7 +1403,7 @@ namespace video {
               }
 
               // reset_display() will sleep between retries
-              reset_display(disp, encoder.platform_formats->dev_type, display_names[display_p], capture_ctxs.front().config);
+              reset_display(disp, capture_dev_type, display_names[display_p], capture_ctxs.front().config);
               if (disp) {
                 proc::proc.display_name = display_names[display_p];
                 break;
@@ -1485,8 +1504,42 @@ namespace video {
     return 0;
   }
 
-  int encode_nvenc(int64_t frame_nr, nvenc_encode_session_t &session, safe::mail_raw_t::queue_t<packet_t> &packets, void *channel_data, std::optional<std::chrono::steady_clock::time_point> frame_timestamp) {
-    auto encoded_frame = session.encode_frame(frame_nr);
+#ifdef PYROWAVE_ENABLED
+  int encode_pyrowave(int64_t frame_nr, avcodec_encode_session_t &session, safe::mail_raw_t::queue_t<packet_t> &packets, void *channel_data, std::optional<std::chrono::steady_clock::time_point> frame_timestamp) {
+    auto *frame = session.device ? session.device->frame : nullptr;
+    if (!session.pyro_session || !frame || frame->format != AV_PIX_FMT_NV12) {
+      BOOST_LOG(error) << "PyroWave encode is missing an NV12 frame";
+      return -1;
+    }
+
+    auto codec_bytes = session.pyro_session->encode(
+      (const std::uint8_t *) frame->data[0], (std::size_t) frame->linesize[0],
+      (const std::uint8_t *) frame->data[1], (std::size_t) frame->linesize[1],
+      session.pyro_max_bytes);
+    if (!codec_bytes || codec_bytes->empty()) {
+      return -1;
+    }
+
+    // The native bitstream goes through the PYRF transport packetizer, which
+    // splits it into block-aligned wire packets with XOR parity.
+    auto rtp_timestamp = (std::uint32_t) ((uint64_t) frame_nr * 90000 / std::max(1, session.pyro_framerate));
+    auto wire = pyrowave::packetize_frame(
+      (std::uint32_t) frame_nr, rtp_timestamp, codec_bytes->data(), codec_bytes->size(),
+      session.pyro_packet_boundary);
+    if (!wire) {
+      return -1;
+    }
+
+    auto packet = std::make_unique<packet_raw_generic>(std::move(*wire), frame_nr, true);
+    packet->channel_data = channel_data;
+    packet->frame_timestamp = frame_timestamp;
+    packets->raise(std::move(packet));
+
+    return 0;
+  }
+#endif
+
+  int encode_nvenc(int64_t frame_nr, nvenc_encode_session_t &session, safe::mail_raw_t::queue_t<packet_t> &packets, void *channel_data, std::optional<std::chrono::steady_clock::time_point> frame_timestamp) {    auto encoded_frame = session.encode_frame(frame_nr);
     if (encoded_frame.data.empty()) {
       BOOST_LOG(error) << "NvENC returned empty packet";
       return -1;
@@ -1507,6 +1560,14 @@ namespace video {
 
   int encode(int64_t frame_nr, encode_session_t &session, safe::mail_raw_t::queue_t<packet_t> &packets, void *channel_data, std::optional<std::chrono::steady_clock::time_point> frame_timestamp) {
     if (auto avcodec_session = dynamic_cast<avcodec_encode_session_t *>(&session)) {
+      if (avcodec_session->pyro_session) {
+#ifdef PYROWAVE_ENABLED
+        return encode_pyrowave(frame_nr, *avcodec_session, packets, channel_data, frame_timestamp);
+#else
+        BOOST_LOG(error) << "PyroWave session exists but this build does not include it";
+        return -1;
+#endif
+      }
       return encode_avcodec(frame_nr, *avcodec_session, packets, channel_data, frame_timestamp);
     } else if (auto nvenc_session = dynamic_cast<nvenc_encode_session_t *>(&session)) {
       return encode_nvenc(frame_nr, *nvenc_session, packets, channel_data, frame_timestamp);
@@ -1887,6 +1948,107 @@ namespace video {
     return session;
   }
 
+#ifdef PYROWAVE_ENABLED
+  std::unique_ptr<avcodec_encode_session_t> make_pyrowave_encode_session(
+    platf::display_t *disp,
+    const encoder_t &encoder,
+    const config_t &config,
+    int width,
+    int height,
+    std::unique_ptr<platf::encode_device_t> encode_device
+  ) {
+    auto avcodec_encode_device = boost::dynamic_pointer_cast<platf::avcodec_encode_device_t>(std::move(encode_device));
+    if (!avcodec_encode_device || avcodec_encode_device->data) {
+      BOOST_LOG(error) << "PyroWave needs a system-memory capture device";
+      return nullptr;
+    }
+    if (config.dynamicRange || config.chromaSamplingType != 0) {
+      BOOST_LOG(error) << "PyroWave currently supports 8-bit 4:2:0 SDR only";
+      return nullptr;
+    }
+    if (config.width % 2 || config.height % 2 || config.width < 2 || config.height < 2) {
+      BOOST_LOG(error) << "PyroWave needs positive even dimensions, got " << config.width << "x" << config.height;
+      return nullptr;
+    }
+
+    constexpr std::size_t pyrowave_outer_header_overhead = 16u;
+    const auto outer_packet_size = config.packetSize > 0 ? (std::size_t) config.packetSize : 0u;
+    const auto outer_payload_capacity = outer_packet_size > pyrowave_outer_header_overhead
+      ? outer_packet_size - pyrowave_outer_header_overhead
+      : 0u;
+    const auto packet_boundary = outer_payload_capacity > LI_PYROWAVE_WIRE_HEADER_SIZE
+      ? outer_payload_capacity - LI_PYROWAVE_WIRE_HEADER_SIZE
+      : 0u;
+    if (packet_boundary <= LI_PYROWAVE_WIRE_HEADER_SIZE ||
+        packet_boundary > LI_PYROWAVE_MAX_PACKET_SIZE - LI_PYROWAVE_WIRE_HEADER_SIZE) {
+      BOOST_LOG(error) << "PyroWave: invalid transport packet boundary " << packet_boundary
+                       << " (outer packet size " << outer_packet_size << ')';
+      return nullptr;
+    }
+
+    int fps = std::max(config.framerate, 1);
+    int kbps = config.bitrate > 0 ? config.bitrate : 150000;
+    if (kbps < 100000) {
+      BOOST_LOG(info) << "Raising PyroWave bitrate from " << kbps << " kbps to 150000 kbps";
+      kbps = 150000;
+    }
+    auto max_bytes = (std::size_t) kbps * 1000ull / 8ull / (std::size_t) fps;
+    if (max_bytes < 64 * 1024) {
+      max_bytes = 64 * 1024;
+    }
+
+    auto colorspace = colorspace_from_client_config(config, disp->is_hdr());
+    auto full_range = colorspace.full_range;
+
+    auto pyro_session = std::make_unique<pyrowave::encode_session_t>();
+    if (!pyro_session->init(config.width, config.height, full_range, kbps, fps)) {
+      return nullptr;
+    }
+
+    // Software conversion into NV12 frames (system memory), matching the
+    // pyrowave CPU encode input contract.
+    avcodec_frame_t frame {av_frame_alloc()};
+    frame->format = AV_PIX_FMT_NV12;
+    frame->width = config.width;
+    frame->height = config.height;
+    frame->color_range = full_range ? AVCOL_RANGE_JPEG : AVCOL_RANGE_MPEG;
+
+    auto software_encode_device = std::make_unique<avcodec_software_encode_device_t>();
+    if (software_encode_device->init(width, height, frame.get(), AV_PIX_FMT_NV12, false)) {
+      BOOST_LOG(error) << "PyroWave software frame conversion init failed";
+      return nullptr;
+    }
+    software_encode_device->colorspace = colorspace;
+    if (software_encode_device->set_frame(frame.release(), nullptr)) {
+      return nullptr;
+    }
+    software_encode_device->apply_colorspace();
+
+    auto session = std::make_unique<avcodec_encode_session_t>(avcodec_ctx_t {}, std::move(software_encode_device), 0);
+    session->pyro_session = std::move(pyro_session);
+    session->pyro_max_bytes = max_bytes;
+    session->pyro_packet_boundary = packet_boundary;
+    session->pyro_framerate = fps;
+
+    BOOST_LOG(info) << "PyroWave encoder " << config.width << "x" << config.height
+                    << " @" << fps << " fps, " << kbps << " kbps ("
+                    << max_bytes << " bytes/frame), packet boundary " << packet_boundary;
+    return session;
+  }
+#else
+  std::unique_ptr<avcodec_encode_session_t> make_pyrowave_encode_session(
+    platf::display_t *,
+    const encoder_t &,
+    const config_t &,
+    int,
+    int,
+    std::unique_ptr<platf::encode_device_t>
+  ) {
+    BOOST_LOG(error) << "PyroWave was requested, but this build does not include it";
+    return nullptr;
+  }
+#endif
+
   std::unique_ptr<nvenc_encode_session_t> make_nvenc_encode_session(const config_t &client_config, std::unique_ptr<platf::nvenc_encode_device_t> encode_device) {
     if (!encode_device->init_encoder(client_config, encode_device->colorspace)) {
       return nullptr;
@@ -1896,6 +2058,9 @@ namespace video {
   }
 
   std::unique_ptr<encode_session_t> make_encode_session(platf::display_t *disp, const encoder_t &encoder, const config_t &config, int width, int height, std::unique_ptr<platf::encode_device_t> encode_device) {
+    if (config.videoFormat == pyrowave::INTERNAL_VIDEO_FORMAT) {
+      return make_pyrowave_encode_session(disp, encoder, config, width, height, std::move(encode_device));
+    }
     if (dynamic_cast<platf::avcodec_encode_device_t *>(encode_device.get())) {
       auto avcodec_encode_device = boost::dynamic_pointer_cast<platf::avcodec_encode_device_t>(std::move(encode_device));
       return make_avcodec_encode_session(disp, encoder, config, width, height, std::move(avcodec_encode_device));
@@ -2099,7 +2264,10 @@ namespace video {
     auto colorspace = colorspace_from_client_config(config, disp.is_hdr());
 
     platf::pix_fmt_e pix_fmt;
-    if (config.chromaSamplingType == 1) {
+    if (config.videoFormat == pyrowave::INTERNAL_VIDEO_FORMAT) {
+      // PyroWave encodes from a system-memory NV12 frame.
+      pix_fmt = platf::pix_fmt_e::nv12;
+    } else if (config.chromaSamplingType == 1) {
       // YUV 4:4:4
       if (!(encoder.flags & YUV444_SUPPORT)) {
         // Encoder can't support YUV 4:4:4 regardless of hardware capabilities
@@ -2118,7 +2286,11 @@ namespace video {
     {
       auto encoder_name = encoder.codec_from_config(config).name;
 
-      BOOST_LOG(info) << "Creating encoder " << logging::bracket(encoder_name);
+      if (config.videoFormat == pyrowave::INTERNAL_VIDEO_FORMAT) {
+        BOOST_LOG(info) << "Creating encoder " << logging::bracket("pyrowave");
+      } else {
+        BOOST_LOG(info) << "Creating encoder " << logging::bracket(encoder_name);
+      }
 
       auto color_coding = colorspace.colorspace == colorspace_e::bt2020    ? "HDR (Rec. 2020 + SMPTE 2084 PQ)" :
                           colorspace.colorspace == colorspace_e::rec601    ? "SDR (Rec. 601)" :
@@ -2207,7 +2379,8 @@ namespace video {
 
     while (encode_session_ctx_queue.running()) {
       // Refresh display names since a display removal might have caused the reinitialization
-      refresh_displays(encoder.platform_formats->dev_type, display_names, display_p);
+      auto capture_dev_type = capture_dev_type_for(encoder, synced_session_ctxs.front()->config);
+      refresh_displays(capture_dev_type, display_names, display_p);
 
       // Process any pending display switch with the new list of displays
       if (switch_display_event->peek()) {
@@ -2215,7 +2388,7 @@ namespace video {
       }
 
       // reset_display() will sleep between retries
-      reset_display(disp, encoder.platform_formats->dev_type, display_names[display_p], synced_session_ctxs.front()->config);
+      reset_display(disp, capture_dev_type, display_names[display_p], synced_session_ctxs.front()->config);
       if (disp) {
         break;
       }

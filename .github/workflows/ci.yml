@@ -1,0 +1,111 @@
+---
+name: CI
+
+permissions:
+  contents: write
+
+on:
+  push:
+    branches:
+      - master
+      - main
+    tags:
+      - "v*"
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: "${{ github.workflow }}-${{ github.ref }}"
+  cancel-in-progress: true
+
+jobs:
+  build-windows:
+    name: Windows (MSYS2 UCRT64, PyroWave)
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: msys2 {0}
+
+    steps:
+      - name: Checkout Apollo
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          fetch-depth: 0
+
+      - name: Checkout PyroWave (AlkaidLab fork)
+        uses: actions/checkout@v4
+        with:
+          repository: AlkaidLab/pyrowave
+          ref: master
+          path: pyrowave-dep
+          submodules: recursive
+
+      - name: Setup Node.js (must be on PATH before cmake)
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Setup MSYS2 UCRT64
+        uses: msys2/setup-msys2@v2
+        with:
+          msystem: UCRT64
+          update: false
+          release: true
+          install: >-
+            git
+            mingw-w64-ucrt-x86_64-cmake
+            mingw-w64-ucrt-x86_64-ninja
+            mingw-w64-ucrt-x86_64-toolchain
+            mingw-w64-ucrt-x86_64-cppwinrt
+            mingw-w64-ucrt-x86_64-curl-winssl
+            mingw-w64-ucrt-x86_64-MinHook
+            mingw-w64-ucrt-x86_64-miniupnpc
+            mingw-w64-ucrt-x86_64-nsis
+            mingw-w64-ucrt-x86_64-onevpl
+            mingw-w64-ucrt-x86_64-openssl
+            mingw-w64-ucrt-x86_64-opus
+            mingw-w64-ucrt-x86_64-nlohmann_json
+            mingw-w64-ucrt-x86_64-boost
+
+      - name: Build and install libpyrowave
+        run: |
+          set -euxo pipefail
+          cmake -B pyrowave-dep/build -S pyrowave-dep \
+            -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_INSTALL_PREFIX="${GITHUB_WORKSPACE}/pyrowave-install" \
+            -DPYROWAVE_INSTALL=ON \
+            -DPYROWAVE_DEVEL=OFF \
+            -DPYROWAVE_UTILS=OFF \
+            -DPYROWAVE_BUILD_TESTS=OFF
+          cmake --build pyrowave-dep/build
+          cmake --install pyrowave-dep/build
+          ls -R "${GITHUB_WORKSPACE}/pyrowave-install" || true
+
+      - name: Configure Apollo
+        run: |
+          set -euxo pipefail
+          cmake -B build -G Ninja -S . \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DPYROWAVE_ROOT="${GITHUB_WORKSPACE}/pyrowave-install"
+
+      - name: Build Apollo
+        run: |
+          set -euxo pipefail
+          cmake --build build
+
+      - name: Package Apollo (portable ZIP)
+        run: |
+          set -euxo pipefail
+          cpack -G ZIP --config ./build/CPackConfig.cmake
+          cpack -G NSIS --config ./build/CPackConfig.cmake || echo "NSIS packaging failed, continuing"
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: apollo-pyrowave-windows
+          path: |
+            *.zip
+            *.exe
+          if-no-files-found: warn
