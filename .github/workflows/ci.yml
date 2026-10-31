@@ -117,7 +117,8 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: apollo-pyrowave-windows
+          # cpack writes into build/cpack_artifacts, not the repo root.
           path: |
-            *.zip
-            *.exe
+            build/cpack_artifacts/*.zip
+            build/cpack_artifacts/*.exe
           if-no-files-found: warn

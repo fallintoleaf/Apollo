@@ -4,14 +4,20 @@ install(TARGETS sunshine RUNTIME DESTINATION "." COMPONENT application)
 # Hardening: include zlib1.dll (loaded via LoadLibrary() in openssl's libcrypto.a)
 install(FILES "${ZLIB}" DESTINATION "." COMPONENT application)
 
-# PyroWave: sunshine.exe imports the C API from pyrowave-shared.dll, and that
-# DLL carries its own MinGW C++ runtime, so both have to sit next to the exe.
-# (Vulkan itself is loaded at runtime through volk, i.e. the GPU driver's
-# vulkan-1.dll, so nothing needs to be bundled for it.)
+# PyroWave: sunshine.exe imports the C API from pyrowave's shared library, and
+# that DLL carries its own MinGW C++ runtime, so both have to sit next to the
+# exe. The DLL is ABI-versioned (libpyrowave-shared-101.dll), so glob instead
+# of hardcoding the name. (Vulkan itself is loaded at runtime through volk,
+# i.e. the GPU driver's vulkan-1.dll, so nothing needs to be bundled for it.)
 if(PYROWAVE_ENABLED)
+    file(GLOB PYROWAVE_RUNTIME_LIBS "${PYROWAVE_ROOT}/bin/*.dll")
+    if(NOT PYROWAVE_RUNTIME_LIBS)
+        message(WARNING "No PyroWave runtime DLL found under ${PYROWAVE_ROOT}/bin; the package will not start")
+    endif()
+
     get_filename_component(MINGW_RUNTIME_BIN "${CMAKE_CXX_COMPILER}" DIRECTORY)
     foreach(PYROWAVE_RUNTIME_DLL
-            "${PYROWAVE_ROOT}/bin/pyrowave-shared.dll"
+            ${PYROWAVE_RUNTIME_LIBS}
             "${MINGW_RUNTIME_BIN}/libstdc++-6.dll"
             "${MINGW_RUNTIME_BIN}/libgcc_s_seh-1.dll"
             "${MINGW_RUNTIME_BIN}/libwinpthread-1.dll")
