@@ -419,12 +419,20 @@ namespace pyrowave {
       return std::nullopt;
     }
 
-    packets_.resize(num_packets);
-    if (pyrowave_encoder_packetize(encoder, packets_.data(), max_bytes, &num_packets,
+    // The C API fills pyrowave_packet entries, whose type is only visible here,
+    // so the results are copied into the header-local POD type afterwards.
+    std::vector<pyrowave_packet> raw_packets(num_packets);
+    if (pyrowave_encoder_packetize(encoder, raw_packets.data(), max_bytes, &num_packets,
                                    bitstream_.data(), bitstream_.size()) != PYROWAVE_SUCCESS ||
         num_packets == 0) {
       BOOST_LOG(error) << "PyroWave packetize failed";
       return std::nullopt;
+    }
+
+    packets_.resize(num_packets);
+    for (size_t i = 0; i < num_packets; ++i) {
+      packets_[i].offset = raw_packets[i].offset;
+      packets_[i].size = raw_packets[i].size;
     }
 
     std::vector<std::uint8_t> encoded;

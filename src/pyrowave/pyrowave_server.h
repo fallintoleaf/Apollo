@@ -20,12 +20,6 @@ extern "C" {
 #include "PyrowaveProtocol.h"
 }
 
-#ifdef PYROWAVE_ENABLED
-// Defined in <pyrowave/pyrowave.h> (global scope). Only the class fields
-// below reference it, and they are compiled together with that header.
-struct pyrowave_packet;
-#endif
-
 namespace pyrowave {
 
   /// Video format value carried in stream config (0 - H.264, 1 - HEVC, 2 - AV1, 3 - PyroWave).
@@ -106,8 +100,16 @@ namespace pyrowave {
     int height_ = 0;
     void *device_ = nullptr;
     void *encoder_ = nullptr;
+    /// Byte range of one encoded packet inside bitstream_.
+    /// Mirrors pyrowave_packet, which cannot be used here: its definition lives
+    /// in <pyrowave/pyrowave.h>, a header that pulls in vulkan.h.
+    struct packet_span {
+      std::size_t offset = 0;
+      std::size_t size = 0;
+    };
+
     std::vector<std::uint8_t> bitstream_;
-    std::vector<pyrowave_packet> packets_;
+    std::vector<packet_span> packets_;
 #endif
   };
 }  // namespace pyrowave

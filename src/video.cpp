@@ -834,9 +834,9 @@ namespace video {
       },
       {
         // SDR-specific options
-        {"profile"s, [](const config_t &cfg) {
-           if (cfg.profile == 66) return "baseline"s;
-           if (cfg.profile == 77) return "main"s;
+        // config_t no longer carries a profile field in this fork, so AMF keeps
+        // the previous default of High profile for 8-bit 4:2:0 sessions.
+        {"profile"s, [](const config_t &) {
            return "high"s;
          }},
       },
