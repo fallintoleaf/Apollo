@@ -1512,6 +1512,7 @@ namespace video {
       return -1;
     }
 
+    const auto encode_start = std::chrono::steady_clock::now();
     auto codec_bytes = session.pyro_session->encode(
       (const std::uint8_t *) frame->data[0], (std::size_t) frame->linesize[0],
       (const std::uint8_t *) frame->data[1], (std::size_t) frame->linesize[1],
@@ -1519,6 +1520,7 @@ namespace video {
     if (!codec_bytes || codec_bytes->empty()) {
       return -1;
     }
+    const auto encode_end = std::chrono::steady_clock::now();
 
     // The native bitstream goes through the PYRF transport packetizer, which
     // splits it into block-aligned wire packets with XOR parity.
@@ -1528,6 +1530,28 @@ namespace video {
       session.pyro_packet_boundary);
     if (!wire) {
       return -1;
+    }
+
+    // Periodic throughput report. Distinguishes "encoder can't keep up" from
+    // "transport is saturated" without needing a profiler attached.
+    static std::uint64_t stat_frames {};
+    static std::uint64_t stat_encode_us {};
+    static std::uint64_t stat_total_us {};
+    static std::uint64_t stat_bytes {};
+    ++stat_frames;
+    stat_encode_us += (std::uint64_t) std::chrono::duration_cast<std::chrono::microseconds>(encode_end - encode_start).count();
+    stat_total_us += (std::uint64_t) std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - encode_start).count();
+    stat_bytes += codec_bytes->size();
+    if (stat_frames >= 300) {
+      const double avg_encode_ms = stat_encode_us / 1000.0 / (double) stat_frames;
+      const double avg_total_ms = stat_total_us / 1000.0 / (double) stat_frames;
+      const double avg_kb = stat_bytes / 1024.0 / (double) stat_frames;
+      const double capacity = avg_total_ms > 0.0 ? 1000.0 / avg_total_ms : 0.0;
+      BOOST_LOG(info) << "PyroWave stats ("sv << stat_frames << " frames): encode "sv
+                      << avg_encode_ms << " ms, encode+packetize "sv << avg_total_ms
+                      << " ms, "sv << avg_kb << " KB/frame, capacity ~"sv
+                      << (int) capacity << " fps"sv;
+      stat_frames = stat_encode_us = stat_total_us = stat_bytes = 0;
     }
 
     auto packet = std::make_unique<packet_raw_generic>(std::move(*wire), frame_nr, true);
@@ -1987,14 +2011,13 @@ namespace video {
     }
 
     int fps = std::max(config.framerate, 1);
-    int kbps = config.bitrate > 0 ? config.bitrate : 150000;
-    if (kbps < 100000) {
-      BOOST_LOG(info) << "Raising PyroWave bitrate from " << kbps << " kbps to 150000 kbps";
-      kbps = 150000;
-    }
+    // Respect the bitrate the client asked for. PyroWave's per-frame byte budget
+    // is its quality knob, so inflating it wastes bandwidth and multiplies the
+    // packet rate (150 Mbps at ~1.3 KB packets is >14k packets/second).
+    int kbps = config.bitrate > 0 ? config.bitrate : 40000;
     auto max_bytes = (std::size_t) kbps * 1000ull / 8ull / (std::size_t) fps;
-    if (max_bytes < 64 * 1024) {
-      max_bytes = 64 * 1024;
+    if (max_bytes < 8 * 1024) {
+      max_bytes = 8 * 1024;
     }
 
     auto colorspace = colorspace_from_client_config(config, disp->is_hdr());
